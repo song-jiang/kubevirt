@@ -425,6 +425,10 @@ func (t *TemplateService) renderLaunchManifest(vmi *v1.VirtualMachineInstance, i
 		command = append(command, "--allow-emulation")
 	}
 
+	if t.clusterConfig.SimulationMode() {
+		command = append(command, "--simulation-mode")
+	}
+
 	if checkForKeepLauncherAfterFailure(vmi) {
 		command = append(command, "--keep-after-failure")
 	}
@@ -911,9 +915,15 @@ func (t *TemplateService) newVolumeRenderer(vmi *v1.VirtualMachineInstance, imag
 func (t *TemplateService) newResourceRenderer(vmi *v1.VirtualMachineInstance, networkToResourceMap map[string]string, memoryOverhead resource.Quantity) (*ResourceRenderer, error) {
 	vmiResources := vmi.Spec.Domain.Resources
 	hypervisorResource := ConstructHypervisorResourceName(t.launcherHypervisorResources)
+	var virtResources k8sv1.ResourceList
+	if t.clusterConfig.SimulationMode() {
+		virtResources = k8sv1.ResourceList{}
+	} else {
+		virtResources = getRequiredResources(vmi, hypervisorResource, t.clusterConfig.AllowEmulation())
+	}
 	baseOptions := []ResourceRendererOption{
 		WithEphemeralStorageRequest(),
-		WithVirtualizationResources(getRequiredResources(vmi, hypervisorResource, t.clusterConfig.AllowEmulation())),
+		WithVirtualizationResources(virtResources),
 	}
 
 	if err := validatePermittedHostDevices(&vmi.Spec, t.clusterConfig); err != nil {
