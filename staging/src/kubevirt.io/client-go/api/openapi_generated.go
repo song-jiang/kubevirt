@@ -20164,6 +20164,13 @@ func schema_kubevirtio_api_core_v1_DeveloperConfiguration(ref common.ReferenceCa
 							Format:      "",
 						},
 					},
+					"simulationMode": {
+						SchemaProps: spec.SchemaProps{
+							Description: "SimulationMode when set to true runs virt-launcher without libvirt/QEMU, faking VM lifecycle and migration. This allows testing infrastructure concerns (networking, storage, scheduling) on clusters without hardware virtualization support. Defaults to false",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
 					"cpuAllocationRatio": {
 						SchemaProps: spec.SchemaProps{
 							Description: "For each requested virtual CPU, CPUAllocationRatio defines how much physical CPU to request per VMI from the hosting node. The value is in fraction of a CPU thread (or core on non-hyperthreaded nodes). For example, a value of 1 means 1 physical CPU thread per VMI CPU thread. A value of 100 would be 1% of a physical thread allocated for each requested VMI thread. This option has no effect on VMIs that request dedicated CPUs. More information at: https://kubevirt.io/user-guide/operations/node_overcommit/#node-cpu-allocation-ratio Defaults to 10",

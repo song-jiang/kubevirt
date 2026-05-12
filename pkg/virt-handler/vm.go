@@ -1844,9 +1844,12 @@ func (c *VirtualMachineController) vmUpdateHelperDefault(vmi *v1.VirtualMachineI
 		return err
 	}
 
-	cgroupManager, err := getCgroupManager(vmi, c.host, c.hypervisorNodeInfo, c.clusterConfig.AllowEmulation())
-	if err != nil {
-		return err
+	var cgroupManager cgroup.Manager
+	if !c.clusterConfig.SimulationMode() {
+		cgroupManager, err = getCgroupManager(vmi, c.host, c.hypervisorNodeInfo, c.clusterConfig.AllowEmulation())
+		if err != nil {
+			return err
+		}
 	}
 
 	var errorTolerantFeaturesError []error
@@ -1897,6 +1900,11 @@ func (c *VirtualMachineController) handleVMIState(vmi *v1.VirtualMachineInstance
 
 // handleRunningVMI contains the logic specifically for running VMs (hotplugging in running state, metrics, network updates)
 func (c *VirtualMachineController) handleRunningVMI(vmi *v1.VirtualMachineInstance, cgroupManager cgroup.Manager, errorTolerantFeaturesError *[]error) error {
+	if c.clusterConfig.SimulationMode() {
+		// In simulation mode, skip hotplug, isolation detection, metrics,
+		// and network updates. There is no real QEMU process to detect.
+		return nil
+	}
 	if err := c.hotplugSriovInterfaces(vmi); err != nil {
 		c.logger.Object(vmi).Error(err.Error())
 	}
@@ -1934,6 +1942,13 @@ func (c *VirtualMachineController) handleStartingVMI(
 	vmi *v1.VirtualMachineInstance,
 	cgroupManager cgroup.Manager,
 ) (bool, error) {
+	if c.clusterConfig.SimulationMode() {
+		// In simulation mode, skip container disk, hotplug volume, device ownership,
+		// network setup, and resource adjustment steps. The pod network is already
+		// configured by the CNI plugin at pod creation time.
+		return true, nil
+	}
+
 	// give containerDisks some time to become ready before throwing errors on retries
 	info := c.launcherClients.GetLauncherClientInfo(vmi)
 	if ready, err := c.containerDiskMounter.ContainerDisksReady(vmi, info.NotInitializedSince); !ready {

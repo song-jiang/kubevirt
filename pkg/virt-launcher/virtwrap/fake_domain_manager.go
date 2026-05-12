@@ -20,7 +20,9 @@
 package virtwrap
 
 import (
+	"encoding/binary"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +30,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
@@ -193,9 +196,13 @@ func (f *FakeDomainManager) SyncVMI(vmi *v1.VirtualMachineInstance, allowEmulati
 
 	if f.domain == nil {
 		f.domain = &api.Domain{}
-		f.domain.ObjectMeta.Name = domainName
+		// ObjectMeta.Name must be the VMI name (not namespace_name) so the
+		// domain cache key (namespace/name) matches the VMI informer key.
+		f.domain.ObjectMeta.Name = vmi.Name
 		f.domain.ObjectMeta.Namespace = vmi.Namespace
 		f.domain.ObjectMeta.UID = vmi.UID
+		// Spec.Name is the libvirt domain name (namespace_name format),
+		// used for PID files and internal identification.
 		f.domain.Spec.Name = domainName
 		f.domain.Spec.UUID = string(vmi.UID)
 		f.domain.Spec.Metadata.KubeVirt.UID = vmi.UID
@@ -206,6 +213,11 @@ func (f *FakeDomainManager) SyncVMI(vmi *v1.VirtualMachineInstance, allowEmulati
 
 		f.domain.SetState(api.Running, api.ReasonUnknown)
 		f.emitEvent(watch.Added)
+
+		// Send GARP to announce the VM's presence on the network
+		if err := sendGARP("eth0"); err != nil {
+			log.Log.Reason(err).Warning("Simulation mode: failed to send GARP on initial boot")
+		}
 	}
 
 	return &f.domain.Spec, nil
@@ -352,9 +364,12 @@ func (f *FakeDomainManager) PrepareMigrationTarget(vmi *v1.VirtualMachineInstanc
 
 	// Create domain on target
 	f.domain = &api.Domain{}
-	f.domain.ObjectMeta.Name = domainName
+	// ObjectMeta.Name must be the VMI name (not namespace_name) so the
+	// domain cache key (namespace/name) matches the VMI informer key.
+	f.domain.ObjectMeta.Name = vmi.Name
 	f.domain.ObjectMeta.Namespace = vmi.Namespace
 	f.domain.ObjectMeta.UID = vmi.UID
+	// Spec.Name is the libvirt domain name (namespace_name format).
 	f.domain.Spec.Name = domainName
 	f.domain.Spec.UUID = string(vmi.UID)
 	f.domain.Spec.Metadata.KubeVirt.UID = vmi.UID
@@ -394,6 +409,13 @@ func (f *FakeDomainManager) simulateTargetReceive(vmi *v1.VirtualMachineInstance
 	})
 
 	log.Log.Object(vmi).Info("Simulation mode: target received VM, domain running")
+
+	// Send GARP to announce the VM's presence after migration.
+	// This simulates what a real VM does when it resumes on the target node,
+	// allowing network agents (e.g., Calico Felix) to detect migration completion.
+	if err := sendGARP("eth0"); err != nil {
+		log.Log.Reason(err).Warning("Simulation mode: failed to send GARP after migration")
+	}
 
 	f.emitEvent(watch.Added)
 }
@@ -503,6 +525,91 @@ func (f *FakeDomainManager) GetDomainDirtyRateStats(_ time.Duration) (*stats.Dom
 
 func (f *FakeDomainManager) GetScreenshot(_ *v1.VirtualMachineInstance) (*cmdv1.ScreenshotResponse, error) {
 	return nil, fmt.Errorf("not supported in simulation mode")
+}
+
+// --- GARP support ---
+
+// sendGARP sends a Gratuitous ARP on the specified interface to announce
+// the pod's IP/MAC to the network. This simulates what a real VM does
+// when it boots or resumes after migration, allowing network agents
+// (e.g., Calico Felix) to detect the VM is ready to receive traffic.
+func sendGARP(ifaceName string) error {
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return fmt.Errorf("failed to get interface %s: %v", ifaceName, err)
+	}
+
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return fmt.Errorf("failed to get addresses for %s: %v", ifaceName, err)
+	}
+
+	var srcIP net.IP
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		if ip4 := ipNet.IP.To4(); ip4 != nil {
+			srcIP = ip4
+			break
+		}
+	}
+	if srcIP == nil {
+		return fmt.Errorf("no IPv4 address found on %s", ifaceName)
+	}
+
+	srcMAC := iface.HardwareAddr
+
+	// Build Gratuitous ARP packet (ARP reply announcing our IP/MAC)
+	// Ethernet header (14 bytes): dst(6) + src(6) + ethertype(2)
+	// ARP payload (28 bytes): htype(2) + ptype(2) + hlen(1) + plen(1) + oper(2) + sha(6) + spa(4) + tha(6) + tpa(4)
+	pkt := make([]byte, 42)
+
+	// Ethernet header
+	copy(pkt[0:6], net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}) // dst: broadcast
+	copy(pkt[6:12], srcMAC)                                              // src: our MAC
+	binary.BigEndian.PutUint16(pkt[12:14], 0x0806)                       // ethertype: ARP
+
+	// ARP payload
+	binary.BigEndian.PutUint16(pkt[14:16], 1)                              // hardware type: Ethernet
+	binary.BigEndian.PutUint16(pkt[16:18], 0x0800)                         // protocol type: IPv4
+	pkt[18] = 6                                                            // hardware address length
+	pkt[19] = 4                                                            // protocol address length
+	binary.BigEndian.PutUint16(pkt[20:22], 2)                              // operation: ARP reply
+	copy(pkt[22:28], srcMAC)                                               // sender hardware address
+	copy(pkt[28:32], srcIP.To4())                                          // sender protocol address
+	copy(pkt[32:38], net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}) // target hardware address
+	copy(pkt[38:42], srcIP.To4())                                          // target protocol address (same as sender for GARP)
+
+	// Open raw socket
+	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, int(htons(syscall.ETH_P_ARP)))
+	if err != nil {
+		return fmt.Errorf("failed to open raw socket: %v", err)
+	}
+	defer syscall.Close(fd)
+
+	// Build sockaddr_ll for sending
+	addr := syscall.SockaddrLinklayer{
+		Protocol: htons(syscall.ETH_P_ARP),
+		Ifindex:  iface.Index,
+		Halen:    6,
+	}
+	copy(addr.Addr[:6], net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
+
+	if err := syscall.Sendto(fd, pkt, 0, &addr); err != nil {
+		return fmt.Errorf("failed to send GARP: %v", err)
+	}
+
+	log.Log.Infof("Simulation mode: sent GARP on %s (IP=%s, MAC=%s)", ifaceName, srcIP, srcMAC)
+	return nil
+}
+
+// htons converts a uint16 from host to network byte order.
+func htons(v uint16) uint16 {
+	var buf [2]byte
+	binary.BigEndian.PutUint16(buf[:], v)
+	return *(*uint16)(unsafe.Pointer(&buf[0]))
 }
 
 // --- Helpers ---
