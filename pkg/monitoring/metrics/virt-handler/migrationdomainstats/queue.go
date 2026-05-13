@@ -108,6 +108,13 @@ func (q *queue) collect() {
 		return
 	}
 
+	// In simulation mode (FakeDomainManager), there is no real libvirt
+	// migration so MigrateDomainJobInfo is nil. Guard against nil dereference.
+	if values.MigrateDomainJobInfo == nil {
+		log.Log.V(4).Infof("no migration domain job info for VMI %s/%s, skipping", q.vmi.Namespace, q.vmi.Name)
+		return
+	}
+
 	r := result{
 		vmi:       q.vmi.Name,
 		namespace: q.vmi.Namespace,

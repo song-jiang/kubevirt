@@ -841,7 +841,13 @@ func (t *TemplateService) newContainerSpecRenderer(vmi *v1.VirtualMachineInstanc
 		WithPorts(vmi),
 		WithCapabilities(vmi),
 	}
-	if util.IsNonRootVMI(vmi) {
+	// In simulation mode, run the compute container as root (UID 0) so that
+	// it gets all capabilities in the bounding set (including CAP_NET_RAW
+	// needed for Gratuitous ARP). Non-root containers in Kubernetes only
+	// receive capabilities via file caps on the binary; the bazeldnf xattrs
+	// tool does not support cap_net_raw, so running as root is the simplest
+	// workaround for test clusters.
+	if util.IsNonRootVMI(vmi) && !t.clusterConfig.SimulationMode() {
 		computeContainerOpts = append(computeContainerOpts, WithNonRoot(userId))
 		computeContainerOpts = append(computeContainerOpts, WithDropALLCapabilities())
 	}
