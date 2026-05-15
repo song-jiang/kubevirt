@@ -380,6 +380,27 @@ func (c *VirtualMachineController) execute(key string) error {
 
 	if domainExists &&
 		(domainMigrated(domain) || domain.DeletionTimestamp != nil) {
+		// In simulation mode, the source domain transitions to Shutoff/Migrated
+		// nearly simultaneously with the target receiving the domain. Without a
+		// real libvirt migration delay, the VM controller can reach this point
+		// before the migration-target controller has finished finalization
+		// (setting MigrationState.Completed, NodeName, etc.).
+		// Calling deleteVM() now would remove the domain from cache and close
+		// the launcher client, causing calculateVmPhaseForStatusReason to return
+		// Failed for a Running VMI with no domain.
+		//
+		// Defer cleanup until the target controller has set Completed=true via
+		// finalizeMigration. We check Completed/Failed rather than EndTimestamp
+		// because the target's ackMigrationCompletion sets EndTimestamp before
+		// finalizeMigration sets Completed.
+		if c.clusterConfig.SimulationMode() &&
+			vmi.Status.MigrationState != nil &&
+			!vmi.Status.MigrationState.Completed &&
+			!vmi.Status.MigrationState.Failed {
+			c.logger.Object(vmi).Info("simulation mode: deferring orphan cleanup, migration not yet finalized")
+			c.queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Second*2)
+			return nil
+		}
 		c.logger.Object(vmi).V(4).Info("detected orphan vmi")
 		return c.deleteVM(vmi)
 	}

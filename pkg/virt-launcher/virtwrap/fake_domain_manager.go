@@ -66,10 +66,13 @@ type DomainEventNotifier interface {
 //
 // Migration methods:
 //   - MigrateVMI (source): sets migration metadata, spawns goroutine that sleeps ~3s
-//     then transitions to Shutoff/Migrated
+//     then transitions to Shutoff/Migrated. The fake process is NOT killed here;
+//     it is left running so virt-handler can process the domain state change before
+//     the pod terminates. The normal KillVMI cleanup path handles process termination.
 //   - PrepareMigrationTarget: creates domain on target, spawns goroutine that sleeps ~2s
-//     then transitions to Running
-//   - FinalizeVirtualMachineMigration: no-op
+//     then transitions to Running and starts a fake process.
+//   - FinalizeVirtualMachineMigration: sends Gratuitous ARP on the target to announce
+//     the VM's presence, allowing network agents (e.g., Calico Felix) to detect migration.
 //   - CancelVMIMigration: sets abort status in migration metadata
 //
 // All other methods return zero values or "not supported in simulation mode".
@@ -86,7 +89,17 @@ type FakeDomainManager struct {
 	fakeCmd *exec.Cmd
 	fakePID int
 	pidFile string
+
+	// Migration idempotency: virt-handler may call MigrateVMI and
+	// PrepareMigrationTarget multiple times during a single migration.
+	// These flags ensure we only spawn one background goroutine per call.
+	migrationStarted       bool
+	targetPreparationDone  bool
 }
+
+// SimBuildIteration is incremented each time the code is rebuilt,
+// so we can verify which version is running in the cluster.
+const SimBuildIteration = 9
 
 // NewFakeDomainManager creates a FakeDomainManager that simulates VM lifecycle.
 func NewFakeDomainManager(
@@ -94,6 +107,7 @@ func NewFakeDomainManager(
 	runWithNonRoot bool,
 	stopChan chan struct{},
 ) *FakeDomainManager {
+	log.Log.Infof("Simulation mode: FakeDomainManager created (build iteration %d)", SimBuildIteration)
 	return &FakeDomainManager{
 		metadataCache:  metadataCache,
 		runWithNonRoot: runWithNonRoot,
@@ -165,6 +179,15 @@ func (f *FakeDomainManager) emitEvent(eventType watch.EventType) {
 		return
 	}
 	domainCopy := f.domain.DeepCopy()
+
+	// Debug: verify migration metadata in the copy
+	if domainCopy.Spec.Metadata.KubeVirt.Migration != nil {
+		log.Log.Infof("Simulation mode: emitEvent(%s) - domain has Migration metadata, EndTimestamp=%v",
+			eventType, domainCopy.Spec.Metadata.KubeVirt.Migration.EndTimestamp)
+	} else {
+		log.Log.Infof("Simulation mode: emitEvent(%s) - domain has NO Migration metadata", eventType)
+	}
+
 	event := watch.Event{
 		Type:   eventType,
 		Object: domainCopy,
@@ -215,7 +238,7 @@ func (f *FakeDomainManager) SyncVMI(vmi *v1.VirtualMachineInstance, allowEmulati
 		f.emitEvent(watch.Added)
 
 		// Send GARP to announce the VM's presence on the network
-		if err := sendGARP("eth0"); err != nil {
+		if err := sendGARP(); err != nil {
 			log.Log.Reason(err).Warning("Simulation mode: failed to send GARP on initial boot")
 		}
 	}
@@ -270,6 +293,18 @@ func (f *FakeDomainManager) KillVMI(vmi *v1.VirtualMachineInstance) error {
 		return nil
 	}
 
+	// Match real LibvirtDomainManager behavior: only destroy if domain is
+	// Running, Paused, or Shutdown. If domain is already Shutoff (e.g.,
+	// after migration with reason=Migrated), do nothing. This is critical
+	// for migration: the VM controller calls deleteVM() -> DeleteDomain()
+	// when it detects domainMigrated (Shutoff/Migrated), which eventually
+	// calls KillVMI. If we changed the state here, we'd overwrite the
+	// Migrated reason before the migration-source controller can process it.
+	if f.domain.Status.Status == api.Shutoff {
+		log.Log.Object(vmi).Info("Simulation mode: domain already shutoff, nothing to do")
+		return nil
+	}
+
 	f.domain.SetState(api.Shutoff, api.ReasonDestroyed)
 	now := metav1.Now()
 	f.domain.ObjectMeta.DeletionTimestamp = &now
@@ -279,8 +314,54 @@ func (f *FakeDomainManager) KillVMI(vmi *v1.VirtualMachineInstance) error {
 	return nil
 }
 
+// DeleteVMI removes the domain definition. In real libvirt this calls
+// virDomainUndefine which removes the domain XML but doesn't destroy the
+// process. The domain must already be shutoff. After undefine, the domain
+// no longer appears in ListAllDomains.
 func (f *FakeDomainManager) DeleteVMI(vmi *v1.VirtualMachineInstance) error {
-	return f.KillVMI(vmi)
+	f.mu.Lock()
+	log.Log.Object(vmi).Info("Simulation mode: DeleteVMI called")
+
+	if f.domain == nil {
+		f.mu.Unlock()
+		return nil
+	}
+
+	// When the domain is Shutoff/Migrated (post-migration cleanup), delay
+	// before marking deletion. This simulates the time a real libvirt
+	// virDomainUndefine takes and gives the migration-source/target
+	// controllers time to process the Shutoff/Migrated state and update
+	// the VMI status (MigrationState.Completed, NodeName, etc.).
+	//
+	// Without this delay, the caller (virt-handler VM controller's
+	// deleteVM -> processVmDelete -> DeleteDomain) returns immediately
+	// and proceeds to processVmCleanup, which removes the domain from
+	// the local cache and closes the launcher client — racing with the
+	// migration controllers.
+	isMigrated := f.domain.Status.Status == api.Shutoff && f.domain.Status.Reason == api.ReasonMigrated
+	f.mu.Unlock()
+
+	if isMigrated {
+		log.Log.Object(vmi).Info("Simulation mode: delaying DeleteVMI for post-migration cleanup")
+		select {
+		case <-time.After(10 * time.Second):
+		case <-f.stopChan:
+			return nil
+		}
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.domain == nil {
+		return nil
+	}
+
+	// Set DeletionTimestamp so the domain is recognized as deleted
+	now := metav1.Now()
+	f.domain.ObjectMeta.DeletionTimestamp = &now
+	f.emitEvent(watch.Modified)
+	return nil
 }
 
 func (f *FakeDomainManager) SignalShutdownVMI(vmi *v1.VirtualMachineInstance) error {
@@ -302,6 +383,13 @@ func (f *FakeDomainManager) ListAllDomains() ([]*api.Domain, error) {
 	if f.domain == nil {
 		return []*api.Domain{}, nil
 	}
+
+	// Debug: log migration metadata state during domain listing (used by resync)
+	if f.domain.Spec.Metadata.KubeVirt.Migration != nil {
+		log.Log.Infof("Simulation mode: ListAllDomains - domain has Migration metadata, EndTimestamp=%v",
+			f.domain.Spec.Metadata.KubeVirt.Migration.EndTimestamp)
+	}
+
 	return []*api.Domain{f.domain.DeepCopy()}, nil
 }
 
@@ -309,6 +397,15 @@ func (f *FakeDomainManager) MigrateVMI(vmi *v1.VirtualMachineInstance, _ *cmdcli
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	log.Log.Object(vmi).Info("Simulation mode: MigrateVMI (source) called")
+
+	// Idempotency guard: virt-handler may call MigrateVMI multiple times
+	// during a single migration (e.g., on re-enqueue). Only start the
+	// background goroutine once.
+	if f.migrationStarted {
+		log.Log.Object(vmi).Info("Simulation mode: migration already started, skipping")
+		return nil
+	}
+	f.migrationStarted = true
 
 	// Initialize migration metadata - get UID from VMI status, same as real code
 	migrationUID := vmi.Status.MigrationState.MigrationUID
@@ -323,6 +420,12 @@ func (f *FakeDomainManager) MigrateVMI(vmi *v1.VirtualMachineInstance, _ *cmdcli
 	}
 	f.metadataCache.Migration.Store(migrationMetadata)
 
+	// Also set migration metadata on the domain object itself.
+	// virt-handler's domain informer receives domain objects via events,
+	// and the migration-source controller checks domain.Spec.Metadata.KubeVirt.Migration
+	// for EndTimestamp to determine when migration is complete.
+	f.domain.Spec.Metadata.KubeVirt.Migration = &migrationMetadata
+
 	// Simulate migration in background
 	go f.simulateMigration(vmi)
 	return nil
@@ -336,21 +439,36 @@ func (f *FakeDomainManager) simulateMigration(vmi *v1.VirtualMachineInstance) {
 		return
 	}
 
-	// Mark migration as completed
+	// Mark migration as completed in metadata
 	now := metav1.Now()
 	f.metadataCache.Migration.WithSafeBlock(func(md *api.MigrationMetadata, initialized bool) {
 		md.EndTimestamp = &now
 	})
 
-	// Transition source to Shutoff/Migrated
+	// Transition source domain to Shutoff/Migrated.
+	//
+	// Important: do NOT kill the fake process here. In the real KubeVirt flow,
+	// libvirt sets the domain state to Shutoff/Migrated first, virt-handler's
+	// migration-source controller detects the state change and updates the VMI
+	// status to mark migration as completed, and only then does the normal
+	// cleanup path (KillVMI) terminate the process and pod.
+	//
+	// If we kill the fake process here, the ProcessMonitor detects the death
+	// and shuts down virt-launcher immediately. virt-handler sees the pod die
+	// before it processes the domain state change, and interprets it as a crash
+	// ("Migration failed vmi shutdown during migration").
 	f.mu.Lock()
 	if f.domain != nil {
 		f.domain.SetState(api.Shutoff, api.ReasonMigrated)
+		// Set EndTimestamp on the domain's migration metadata so that
+		// virt-handler's migration-source controller can detect completion.
+		if f.domain.Spec.Metadata.KubeVirt.Migration != nil {
+			f.domain.Spec.Metadata.KubeVirt.Migration.EndTimestamp = &now
+		}
 	}
-	f.killFakeProcess()
 	f.mu.Unlock()
 
-	log.Log.Object(vmi).Info("Simulation mode: migration completed on source, domain shutoff")
+	log.Log.Object(vmi).Info("Simulation mode: migration completed on source, domain shutoff (process kept alive for cleanup)")
 
 	f.emitEvent(watch.Modified)
 }
@@ -359,6 +477,15 @@ func (f *FakeDomainManager) PrepareMigrationTarget(vmi *v1.VirtualMachineInstanc
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	log.Log.Object(vmi).Info("Simulation mode: PrepareMigrationTarget called")
+
+	// Idempotency guard: virt-handler may call PrepareMigrationTarget multiple
+	// times during a single migration. Only set up the domain and start the
+	// background goroutine once.
+	if f.targetPreparationDone {
+		log.Log.Object(vmi).Info("Simulation mode: target preparation already done, skipping")
+		return nil
+	}
+	f.targetPreparationDone = true
 
 	domainName := api.VMINamespaceKeyFunc(vmi)
 
@@ -378,11 +505,18 @@ func (f *FakeDomainManager) PrepareMigrationTarget(vmi *v1.VirtualMachineInstanc
 
 	// Initialize migration metadata on target
 	now := metav1.Now()
-	f.metadataCache.Migration.Store(api.MigrationMetadata{
+	targetMigrationMeta := api.MigrationMetadata{
 		UID:            vmi.Status.MigrationState.MigrationUID,
 		StartTimestamp: &now,
 		Mode:           v1.MigrationPreCopy,
-	})
+	}
+	f.metadataCache.Migration.Store(targetMigrationMeta)
+
+	// Also set migration metadata on the domain object itself.
+	// virt-handler's migration-target controller checks
+	// domain.Spec.Metadata.KubeVirt.Migration.EndTimestamp to determine
+	// when migration is complete and call ackMigrationCompletion.
+	f.domain.Spec.Metadata.KubeVirt.Migration = &targetMigrationMeta
 
 	// Simulate target receiving the VM in the background
 	go f.simulateTargetReceive(vmi, domainName)
@@ -400,22 +534,42 @@ func (f *FakeDomainManager) simulateTargetReceive(vmi *v1.VirtualMachineInstance
 	f.mu.Lock()
 	f.domain.SetState(api.Running, api.ReasonUnknown)
 	f.startFakeProcess(domainName)
+
+	// Mark migration complete on target — set EndTimestamp in both the
+	// metadata cache and on the domain object. The domain object is what
+	// virt-handler's domain informer sees; the target controller's
+	// updateStatus checks domain.Spec.Metadata.KubeVirt.Migration.EndTimestamp
+	// to call ackMigrationCompletion, which sets vmi.Status.MigrationState.EndTimestamp,
+	// which is required for migrationNeedsFinalization to return true.
+	now := metav1.Now()
+	if f.domain.Spec.Metadata.KubeVirt.Migration != nil {
+		f.domain.Spec.Metadata.KubeVirt.Migration.EndTimestamp = &now
+	}
 	f.mu.Unlock()
 
-	// Mark migration complete on target
-	now := metav1.Now()
 	f.metadataCache.Migration.WithSafeBlock(func(md *api.MigrationMetadata, initialized bool) {
 		md.EndTimestamp = &now
 	})
 
+	// Debug: log migration metadata state before emitting event
+	f.mu.Lock()
+	if f.domain.Spec.Metadata.KubeVirt.Migration != nil {
+		log.Log.Object(vmi).Infof("Simulation mode: domain.Migration set - UID=%s, StartTimestamp=%v, EndTimestamp=%v",
+			f.domain.Spec.Metadata.KubeVirt.Migration.UID,
+			f.domain.Spec.Metadata.KubeVirt.Migration.StartTimestamp,
+			f.domain.Spec.Metadata.KubeVirt.Migration.EndTimestamp)
+	} else {
+		log.Log.Object(vmi).Warning("Simulation mode: domain.Migration is NIL before emitting event!")
+	}
+	f.mu.Unlock()
+
 	log.Log.Object(vmi).Info("Simulation mode: target received VM, domain running")
 
-	// Send GARP to announce the VM's presence after migration.
-	// This simulates what a real VM does when it resumes on the target node,
-	// allowing network agents (e.g., Calico Felix) to detect migration completion.
-	if err := sendGARP("eth0"); err != nil {
-		log.Log.Reason(err).Warning("Simulation mode: failed to send GARP after migration")
-	}
+	// Note: GARP is NOT sent here. During PrepareMigrationTarget the pod's
+	// network interface may not be fully up yet ("network is down"). Instead,
+	// GARP is sent in FinalizeVirtualMachineMigration, which is called by
+	// virt-handler after the migration is fully complete and the target pod
+	// is the active one.
 
 	f.emitEvent(watch.Added)
 }
@@ -445,7 +599,18 @@ func (f *FakeDomainManager) CancelVMIMigration(vmi *v1.VirtualMachineInstance) e
 }
 
 func (f *FakeDomainManager) FinalizeVirtualMachineMigration(vmi *v1.VirtualMachineInstance, options *cmdv1.VirtualMachineOptions) error {
-	log.Log.Object(vmi).Info("Simulation mode: FinalizeVirtualMachineMigration called (no-op)")
+	log.Log.Object(vmi).Info("Simulation mode: FinalizeVirtualMachineMigration called")
+
+	// Send GARP to announce the VM's presence on the target node.
+	// This is done here (not in PrepareMigrationTarget/simulateTargetReceive)
+	// because the pod's network interface is guaranteed to be up at this point.
+	// In the real KubeVirt flow, the VM resumes on the target and naturally
+	// sends GARPs. Network agents like Calico Felix use the GARP to detect
+	// that the VM has migrated and update their dataplane accordingly.
+	if err := sendGARP(); err != nil {
+		log.Log.Reason(err).Warning("Simulation mode: failed to send GARP after migration finalization")
+	}
+
 	return nil
 }
 
@@ -529,19 +694,27 @@ func (f *FakeDomainManager) GetScreenshot(_ *v1.VirtualMachineInstance) (*cmdv1.
 
 // --- GARP support ---
 
-// sendGARP sends a Gratuitous ARP on the specified interface to announce
-// the pod's IP/MAC to the network. This simulates what a real VM does
-// when it boots or resumes after migration, allowing network agents
-// (e.g., Calico Felix) to detect the VM is ready to receive traffic.
-func sendGARP(ifaceName string) error {
-	iface, err := net.InterfaceByName(ifaceName)
+// sendGARP sends a Gratuitous ARP to announce the pod's IP/MAC to the network.
+// This simulates what a real VM does when it boots or resumes after migration,
+// allowing network agents (e.g., Calico Felix) to detect the VM is ready.
+//
+// In bridge binding mode, the pod's network interfaces are reorganized:
+//   - eth0: dummy interface (state DOWN, NOARP) — holds the pod IP
+//   - eth0-nic: original veth (state UP) — bridge port, connected to host
+//   - k6t-eth0: bridge device
+//   - tap0: tap for QEMU
+//
+// We must get the IP from eth0 but send the packet on eth0-nic (the live veth).
+func sendGARP() error {
+	// Get the pod IP from eth0 (dummy interface that holds the address)
+	ipIface, err := net.InterfaceByName("eth0")
 	if err != nil {
-		return fmt.Errorf("failed to get interface %s: %v", ifaceName, err)
+		return fmt.Errorf("failed to get interface eth0: %v", err)
 	}
 
-	addrs, err := iface.Addrs()
+	addrs, err := ipIface.Addrs()
 	if err != nil {
-		return fmt.Errorf("failed to get addresses for %s: %v", ifaceName, err)
+		return fmt.Errorf("failed to get addresses for eth0: %v", err)
 	}
 
 	var srcIP net.IP
@@ -556,10 +729,21 @@ func sendGARP(ifaceName string) error {
 		}
 	}
 	if srcIP == nil {
-		return fmt.Errorf("no IPv4 address found on %s", ifaceName)
+		return fmt.Errorf("no IPv4 address found on eth0")
 	}
 
-	srcMAC := iface.HardwareAddr
+	// Determine the send interface: use eth0-nic (the live veth) if it exists
+	// (bridge binding mode), otherwise fall back to eth0 (no bridge).
+	sendIfaceName := "eth0"
+	sendIface, err := net.InterfaceByName("eth0-nic")
+	if err != nil {
+		// No bridge binding — use eth0 directly
+		sendIface = ipIface
+	} else {
+		sendIfaceName = "eth0-nic"
+	}
+
+	srcMAC := sendIface.HardwareAddr
 
 	// Build Gratuitous ARP packet (ARP reply announcing our IP/MAC)
 	// Ethernet header (14 bytes): dst(6) + src(6) + ethertype(2)
@@ -592,16 +776,16 @@ func sendGARP(ifaceName string) error {
 	// Build sockaddr_ll for sending
 	addr := syscall.SockaddrLinklayer{
 		Protocol: htons(syscall.ETH_P_ARP),
-		Ifindex:  iface.Index,
+		Ifindex:  sendIface.Index,
 		Halen:    6,
 	}
 	copy(addr.Addr[:6], net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
 
 	if err := syscall.Sendto(fd, pkt, 0, &addr); err != nil {
-		return fmt.Errorf("failed to send GARP: %v", err)
+		return fmt.Errorf("failed to send GARP on %s: %v", sendIfaceName, err)
 	}
 
-	log.Log.Infof("Simulation mode: sent GARP on %s (IP=%s, MAC=%s)", ifaceName, srcIP, srcMAC)
+	log.Log.Infof("Simulation mode: sent GARP on %s (IP=%s, MAC=%s)", sendIfaceName, srcIP, srcMAC)
 	return nil
 }
 
