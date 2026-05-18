@@ -99,7 +99,7 @@ type FakeDomainManager struct {
 
 // SimBuildIteration is incremented each time the code is rebuilt,
 // so we can verify which version is running in the cluster.
-const SimBuildIteration = 9
+const SimBuildIteration = 11
 
 // NewFakeDomainManager creates a FakeDomainManager that simulates VM lifecycle.
 func NewFakeDomainManager(
@@ -229,6 +229,32 @@ func (f *FakeDomainManager) SyncVMI(vmi *v1.VirtualMachineInstance, allowEmulati
 		f.domain.Spec.Name = domainName
 		f.domain.Spec.UUID = string(vmi.UID)
 		f.domain.Spec.Metadata.KubeVirt.UID = vmi.UID
+
+		// Populate domain interfaces from VMI spec so virt-handler's
+		// ifacesStatusFromDomainInterfaces can create interface status
+		// entries with the correct Name (from alias) and MAC. These
+		// entries are then matched by MAC with InterfacesStatus() data
+		// to populate vmi.Status.Interfaces with IP addresses.
+		for i, iface := range vmi.Spec.Domain.Devices.Interfaces {
+			domainIface := api.Interface{
+				Alias: api.NewUserDefinedAlias(iface.Name),
+			}
+			// Get MAC from VMI spec or from the pod's eth0 for the primary interface
+			if iface.MacAddress != "" {
+				domainIface.MAC = &api.MAC{MAC: iface.MacAddress}
+			} else if i == 0 {
+				// For the primary interface, use the pod's eth0 MAC
+				if podIface, err := net.InterfaceByName("eth0"); err == nil {
+					domainIface.MAC = &api.MAC{MAC: podIface.HardwareAddr.String()}
+				}
+			}
+			f.domain.Spec.Devices.Interfaces = append(f.domain.Spec.Devices.Interfaces, domainIface)
+		}
+
+		// Set Status.Interfaces directly on the domain object so the
+		// domain informer picks up the IP immediately (rather than
+		// waiting for the 5-minute GetDomain resync).
+		f.domain.Status.Interfaces = f.InterfacesStatus()
 
 		f.metadataCache.UID.Set(vmi.UID)
 
@@ -501,6 +527,21 @@ func (f *FakeDomainManager) PrepareMigrationTarget(vmi *v1.VirtualMachineInstanc
 	f.domain.Spec.UUID = string(vmi.UID)
 	f.domain.Spec.Metadata.KubeVirt.UID = vmi.UID
 
+	// Populate domain interfaces (same as SyncVMI)
+	for i, iface := range vmi.Spec.Domain.Devices.Interfaces {
+		domainIface := api.Interface{
+			Alias: api.NewUserDefinedAlias(iface.Name),
+		}
+		if iface.MacAddress != "" {
+			domainIface.MAC = &api.MAC{MAC: iface.MacAddress}
+		} else if i == 0 {
+			if podIface, err := net.InterfaceByName("eth0"); err == nil {
+				domainIface.MAC = &api.MAC{MAC: podIface.HardwareAddr.String()}
+			}
+		}
+		f.domain.Spec.Devices.Interfaces = append(f.domain.Spec.Devices.Interfaces, domainIface)
+	}
+
 	f.metadataCache.UID.Set(vmi.UID)
 
 	// Initialize migration metadata on target
@@ -534,6 +575,10 @@ func (f *FakeDomainManager) simulateTargetReceive(vmi *v1.VirtualMachineInstance
 	f.mu.Lock()
 	f.domain.SetState(api.Running, api.ReasonUnknown)
 	f.startFakeProcess(domainName)
+
+	// Set Status.Interfaces so the domain informer picks up the IP
+	// immediately (same as in SyncVMI).
+	f.domain.Status.Interfaces = f.InterfacesStatus()
 
 	// Mark migration complete on target — set EndTimestamp in both the
 	// metadata cache and on the domain object. The domain object is what
@@ -633,7 +678,38 @@ func (f *FakeDomainManager) HotplugHostDevices(_ *v1.VirtualMachineInstance) err
 }
 
 func (f *FakeDomainManager) InterfacesStatus() []api.InterfaceStatus {
-	return nil
+	// Report the pod's IP so virt-handler populates vmi.Status.Interfaces.
+	// In real KubeVirt this comes from the QEMU guest agent; in simulation
+	// mode we read the pod's network interfaces directly.
+	ipIface, err := net.InterfaceByName("eth0")
+	if err != nil {
+		return nil
+	}
+	addrs, err := ipIface.Addrs()
+	if err != nil {
+		return nil
+	}
+
+	var ips []string
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ips = append(ips, ipNet.IP.String())
+	}
+	if len(ips) == 0 {
+		return nil
+	}
+
+	return []api.InterfaceStatus{
+		{
+			Mac:           ipIface.HardwareAddr.String(),
+			Ip:            ips[0],
+			IPs:           ips,
+			InterfaceName: "eth0",
+		},
+	}
 }
 
 func (f *FakeDomainManager) GetGuestOSInfo() *api.GuestOSInfo {
