@@ -105,6 +105,10 @@ func (c *ClusterConfig) AllowEmulation() bool {
 	return c.GetConfig().DeveloperConfiguration.UseEmulation
 }
 
+func (c *ClusterConfig) SimulationMode() bool {
+	return c.GetConfig().DeveloperConfiguration.SimulationMode
+}
+
 func (c *ClusterConfig) GetMigrationConfiguration() *v1.MigrationConfiguration {
 	migrationConfig := c.GetConfig().MigrationConfiguration
 	// For backward compatibility, AllowWorkloadDisruption will follow the

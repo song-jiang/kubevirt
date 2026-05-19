@@ -3388,6 +3388,11 @@ type DeveloperConfiguration struct {
 	// UseEmulation can be set to true to allow fallback to software emulation
 	// in case hardware-assisted emulation is not available. Defaults to false
 	UseEmulation bool `json:"useEmulation,omitempty"`
+	// SimulationMode when set to true runs virt-launcher without libvirt/QEMU,
+	// faking VM lifecycle and migration. This allows testing infrastructure
+	// concerns (networking, storage, scheduling) on clusters without hardware
+	// virtualization support. Defaults to false
+	SimulationMode bool `json:"simulationMode,omitempty"`
 	// For each requested virtual CPU, CPUAllocationRatio defines how much physical CPU to request per VMI
 	// from the hosting node. The value is in fraction of a CPU thread (or core on non-hyperthreaded nodes).
 	// For example, a value of 1 means 1 physical CPU thread per VMI CPU thread.

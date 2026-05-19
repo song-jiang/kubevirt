@@ -366,6 +366,7 @@ func main() {
 	simulateCrash := pflag.Bool("simulate-crash", false, "Causes virt-launcher to immediately crash. This is used by functional tests to simulate crash loop scenarios.")
 	libvirtLogFilters := pflag.String("libvirt-log-filters", "", "Set custom log filters for libvirt")
 	hypervisor := pflag.String("hypervisor", v1.KvmHypervisorName, "Hypervisor to be used by the VMI")
+	simulationMode := pflag.Bool("simulation-mode", false, "Run without libvirt/QEMU, simulating VM lifecycle for testing")
 
 	pflag.CommandLine.AddGoFlag(goflag.CommandLine.Lookup("v"))
 	pflag.Parse()
@@ -412,62 +413,82 @@ func main() {
 		panic(err)
 	}
 
-	// Start virtqemud, virtlogd, and establish libvirt connection
-	stopChan := make(chan struct{})
-
-	l := util.NewLibvirtWrapper(*runWithNonRoot)
-	err = l.SetupLibvirt(libvirtLogFilters)
-	if err != nil {
-		panic(err)
-	}
-
-	l.StartVirtqemud(stopChan)
-	// only single domain should be present
 	domainName := api.VMINamespaceKeyFunc(vmi)
-
-	util.StartVirtlog(stopChan, domainName, *runWithNonRoot)
-
-	domainConn := createLibvirtConnection(*runWithNonRoot)
-	defer domainConn.Close()
-
-	var agentStore = agentpoller.NewAsyncAgentStore()
+	stopChan := make(chan struct{})
+	signalStopChan := make(chan struct{})
+	metadataCache := metadata.NewCache()
 
 	notifier := notifyclient.NewNotifier(*virtShareDir)
 	defer notifier.Close()
 
-	metadataCache := metadata.NewCache()
+	events := make(chan watch.Event, 2)
 
-	signalStopChan := make(chan struct{})
+	var domainManager virtwrap.DomainManager
+	var cmdServerDone chan struct{}
+	var preMigrationHookServerDone <-chan struct{}
 
-	hookFuncs := []premigrationhookserver.HookFunc{
-		cpuhook.CPUDedicatedHook,
-	}
-	if *ifacesOrdinalNamingUpgradeEnabled {
-		hookFuncs = append(hookFuncs, network.UpgradeOrdinalNamingScheme)
-	}
+	if *simulationMode {
+		// Simulation mode: skip libvirt/QEMU entirely, use FakeDomainManager
+		log.Log.Info("SIMULATION MODE: Running without libvirt/QEMU")
 
-	preMigrationHookServer := premigrationhookserver.NewPreMigrationHookServer(
-		stopChan,
-		hookFuncs...,
-	)
-	domainManager, err := virtwrap.NewLibvirtDomainManager(domainConn, *virtShareDir, *ephemeralDiskDir, &agentStore, *ovmfPath, ephemeralDiskCreator, metadataCache, signalStopChan, *diskMemoryLimitBytes, util.GetPodCPUSet, *imageVolumeEnabled, *libvirtHooksServerAndClientEnabled, preMigrationHookServer, *hypervisor)
-	if err != nil {
-		panic(err)
-	}
-	if *libvirtHooksServerAndClientEnabled {
-		// TODO: replaceQemuHookWithCustomClient This code should be removed once the LibvirtHooksServerAndClient feature is GA.
-		// Instead of overriding the script at runtime, we can include the custom binary in the launcher image at build time.
-		if err := replaceQemuHookWithCustomClient(); err != nil {
+		fakeDM := virtwrap.NewFakeDomainManager(metadataCache, *runWithNonRoot, signalStopChan)
+		fakeDM.SetNotifier(notifier)
+		fakeDM.SetEventsChan(events)
+		domainManager = fakeDM
+
+		options := cmdserver.NewServerOptions(*allowEmulation)
+		cmdclient.SetBaseDir(*virtShareDir)
+		cmdServerDone = startCmdServer(cmdclient.UninitializedSocketOnGuest(), domainManager, stopChan, options)
+
+		closedCh := make(chan struct{})
+		close(closedCh)
+		preMigrationHookServerDone = closedCh
+	} else {
+		// Real mode: start libvirt and use LibvirtDomainManager
+		l := util.NewLibvirtWrapper(*runWithNonRoot)
+		err = l.SetupLibvirt(libvirtLogFilters)
+		if err != nil {
 			panic(err)
 		}
-	}
 
-	// Start the virt-launcher command service.
-	// Clients can use this service to tell virt-launcher
-	// to start/stop virtual machines
-	options := cmdserver.NewServerOptions(*allowEmulation)
-	cmdclient.SetBaseDir(*virtShareDir)
-	cmdServerDone := startCmdServer(cmdclient.UninitializedSocketOnGuest(), domainManager, stopChan, options)
+		l.StartVirtqemud(stopChan)
+		util.StartVirtlog(stopChan, domainName, *runWithNonRoot)
+
+		domainConn := createLibvirtConnection(*runWithNonRoot)
+		defer domainConn.Close()
+
+		var agentStore = agentpoller.NewAsyncAgentStore()
+
+		hookFuncs := []premigrationhookserver.HookFunc{
+			cpuhook.CPUDedicatedHook,
+		}
+		if *ifacesOrdinalNamingUpgradeEnabled {
+			hookFuncs = append(hookFuncs, network.UpgradeOrdinalNamingScheme)
+		}
+
+		preMigrationHookServer := premigrationhookserver.NewPreMigrationHookServer(
+			stopChan,
+			hookFuncs...,
+		)
+		domainManager, err = virtwrap.NewLibvirtDomainManager(domainConn, *virtShareDir, *ephemeralDiskDir, &agentStore, *ovmfPath, ephemeralDiskCreator, metadataCache, signalStopChan, *diskMemoryLimitBytes, util.GetPodCPUSet, *imageVolumeEnabled, *libvirtHooksServerAndClientEnabled, preMigrationHookServer, *hypervisor)
+		if err != nil {
+			panic(err)
+		}
+		if *libvirtHooksServerAndClientEnabled {
+			if err := replaceQemuHookWithCustomClient(); err != nil {
+				panic(err)
+			}
+		}
+
+		options := cmdserver.NewServerOptions(*allowEmulation)
+		cmdclient.SetBaseDir(*virtShareDir)
+		cmdServerDone = startCmdServer(cmdclient.UninitializedSocketOnGuest(), domainManager, stopChan, options)
+
+		// Send domain notifications to virt-handler
+		startDomainEventMonitoring(notifier, domainConn, events, vmi, domainName, &agentStore, *qemuAgentSysInterval, *qemuAgentFileInterval, *qemuAgentUserInterval, *qemuAgentVersionInterval, *qemuAgentFSFreezeStatusInterval, metadataCache)
+
+		preMigrationHookServerDone = preMigrationHookServer.Done()
+	}
 
 	gracefulShutdownCallback := func() {
 		domainManager.MarkGracefulShutdownVMI()
@@ -485,10 +506,6 @@ func main() {
 			}
 		}
 	}
-
-	events := make(chan watch.Event, 2)
-	// Send domain notifications to virt-handler
-	startDomainEventMonitoring(notifier, domainConn, events, vmi, domainName, &agentStore, *qemuAgentSysInterval, *qemuAgentFileInterval, *qemuAgentUserInterval, *qemuAgentVersionInterval, *qemuAgentFSFreezeStatusInterval, metadataCache)
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt,
@@ -539,7 +556,7 @@ func main() {
 
 	close(stopChan)
 	<-cmdServerDone
-	<-preMigrationHookServer.Done()
+	<-preMigrationHookServerDone
 
 	log.Log.Info("Exiting...")
 }

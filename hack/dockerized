@@ -186,6 +186,18 @@ if [ -z "$($KUBEVIRT_CRI ps --format '{{.Names}}' | grep ${BUILDER}-bazel-server
     $KUBEVIRT_CRI run ${CONTAINER_ENV} --ulimit nofile=10000:10000 --network host -d ${volumes} --security-opt "label=disable" --name ${BUILDER}-bazel-server -w "/root/go/src/kubevirt.io/kubevirt" --rm ${KUBEVIRT_BUILDER_IMAGE} hack/bazel-server.sh
 fi
 
+# Ensure docker credentials are available inside the bazel server container.
+# The volume mount (lines above) only takes effect when the container is first
+# created. If the container was already running (e.g. from a prior make target),
+# the credentials won't be present. Copy them in explicitly to handle both cases.
+if [[ $KUBEVIRT_CRI = podman* ]] && [[ -f "${XDG_RUNTIME_DIR}/containers/auth.json" ]]; then
+    $KUBEVIRT_CRI exec ${BUILDER}-bazel-server mkdir -p /root/.docker
+    $KUBEVIRT_CRI cp "${XDG_RUNTIME_DIR}/containers/auth.json" ${BUILDER}-bazel-server:/root/.docker/config.json
+elif [[ -f "${HOME}/.docker/config.json" ]]; then
+    $KUBEVIRT_CRI exec ${BUILDER}-bazel-server mkdir -p /root/.docker
+    $KUBEVIRT_CRI cp "${HOME}/.docker/config.json" ${BUILDER}-bazel-server:/root/.docker/config.json
+fi
+
 # Update cert trust, if custom is provided
 if [ -n "$DOCKER_CA_CERT_FILE" ] && [ -f "$DOCKER_CA_CERT_FILE" ]; then
     $KUBEVIRT_CRI exec ${CONTAINER_ENV} ${BUILDER}-bazel-server /entrypoint.sh "/usr/bin/update-ca-trust"
