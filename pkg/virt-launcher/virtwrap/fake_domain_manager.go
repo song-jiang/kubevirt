@@ -99,7 +99,7 @@ type FakeDomainManager struct {
 
 // SimBuildIteration is incremented each time the code is rebuilt,
 // so we can verify which version is running in the cluster.
-const SimBuildIteration = 11
+const SimBuildIteration = 14
 
 // NewFakeDomainManager creates a FakeDomainManager that simulates VM lifecycle.
 func NewFakeDomainManager(
@@ -352,28 +352,16 @@ func (f *FakeDomainManager) DeleteVMI(vmi *v1.VirtualMachineInstance) error {
 		f.mu.Unlock()
 		return nil
 	}
-
-	// When the domain is Shutoff/Migrated (post-migration cleanup), delay
-	// before marking deletion. This simulates the time a real libvirt
-	// virDomainUndefine takes and gives the migration-source/target
-	// controllers time to process the Shutoff/Migrated state and update
-	// the VMI status (MigrationState.Completed, NodeName, etc.).
-	//
-	// Without this delay, the caller (virt-handler VM controller's
-	// deleteVM -> processVmDelete -> DeleteDomain) returns immediately
-	// and proceeds to processVmCleanup, which removes the domain from
-	// the local cache and closes the launcher client — racing with the
-	// migration controllers.
-	isMigrated := f.domain.Status.Status == api.Shutoff && f.domain.Status.Reason == api.ReasonMigrated
 	f.mu.Unlock()
 
-	if isMigrated {
-		log.Log.Object(vmi).Info("Simulation mode: delaying DeleteVMI for post-migration cleanup")
-		select {
-		case <-time.After(10 * time.Second):
-		case <-f.stopChan:
-			return nil
-		}
+	// Simulate the time a real libvirt virDomainUndefine + domain shutdown
+	// takes. This gives the migration controllers time to process the
+	// domain state and update the VMI status before the process exits.
+	log.Log.Object(vmi).Info("Simulation mode: delaying DeleteVMI to simulate domain shutdown")
+	select {
+	case <-time.After(5 * time.Second):
+	case <-f.stopChan:
+		return nil
 	}
 
 	f.mu.Lock()
@@ -387,6 +375,13 @@ func (f *FakeDomainManager) DeleteVMI(vmi *v1.VirtualMachineInstance) error {
 	now := metav1.Now()
 	f.domain.ObjectMeta.DeletionTimestamp = &now
 	f.emitEvent(watch.Modified)
+
+	// Kill the fake process so ProcessMonitor detects the exit and
+	// virt-launcher shuts down. Without this, the source pod stays
+	// running indefinitely after migration because nothing else
+	// terminates the fake process (KillVMI is a no-op when the
+	// domain is already Shutoff/Migrated).
+	f.killFakeProcess()
 	return nil
 }
 

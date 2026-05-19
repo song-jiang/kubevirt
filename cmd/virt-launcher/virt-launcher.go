@@ -440,7 +440,9 @@ func main() {
 		cmdclient.SetBaseDir(*virtShareDir)
 		cmdServerDone = startCmdServer(cmdclient.UninitializedSocketOnGuest(), domainManager, stopChan, options)
 
-		preMigrationHookServerDone = make(chan struct{})
+		closedCh := make(chan struct{})
+		close(closedCh)
+		preMigrationHookServerDone = closedCh
 	} else {
 		// Real mode: start libvirt and use LibvirtDomainManager
 		l := util.NewLibvirtWrapper(*runWithNonRoot)

@@ -344,6 +344,13 @@ func (t *TemplateService) renderLaunchManifest(vmi *v1.VirtualMachineInstance, i
 	gracePeriodSeconds := gracePeriodInSeconds(vmi) + gracePeriodPaddingSeconds
 	gracePeriodKillAfter := gracePeriodSeconds + gracePeriodPaddingSeconds
 
+	// In simulation mode there is no real QEMU process to gracefully shut
+	// down, so use a minimal termination grace period to speed up source
+	// pod cleanup after migration.
+	if t.clusterConfig.SimulationMode() {
+		gracePeriodKillAfter = 5
+	}
+
 	imagePullSecrets := imgPullSecrets(vmi.Spec.Volumes...)
 	if util.HasKernelBootContainerImage(vmi) && vmi.Spec.Domain.Firmware.KernelBoot.Container.ImagePullSecret != "" {
 		imagePullSecrets = appendUniqueImagePullSecret(imagePullSecrets, k8sv1.LocalObjectReference{
