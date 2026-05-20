@@ -306,6 +306,9 @@ func (c *BaseController) setupNetwork(vmi *v1.VirtualMachineInstance, networks [
 	if len(networks) == 0 {
 		return nil
 	}
+	if c.clusterConfig.SimulationMode() {
+		return nil
+	}
 
 	isolationRes, err := c.podIsolationDetector.Detect(vmi)
 	if err != nil {

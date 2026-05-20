@@ -99,7 +99,7 @@ type FakeDomainManager struct {
 
 // SimBuildIteration is incremented each time the code is rebuilt,
 // so we can verify which version is running in the cluster.
-const SimBuildIteration = 14
+const SimBuildIteration = 15
 
 // NewFakeDomainManager creates a FakeDomainManager that simulates VM lifecycle.
 func NewFakeDomainManager(
