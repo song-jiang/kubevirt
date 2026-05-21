@@ -1,0 +1,27 @@
+version: v1.0
+name: KubeVirt Simulation Mode Images
+agent:
+  machine:
+    type: f1-standard-2
+    os_image: ubuntu2204
+
+blocks:
+  - name: Build and push images
+    run:
+      when: "branch = 'mockVirt-v1.8.1'"
+    task:
+      secrets:
+        - name: quay-tigeradev
+      env_vars:
+        - name: DOCKER_PREFIX
+          value: quay.io/tigeradev
+        - name: DOCKER_TAG
+          value: mockvirt-v1.8.1
+      prologue:
+        commands:
+          - echo "$QUAY_TOKEN" | docker login quay.io --username "$QUAY_USER" --password-stdin
+      jobs:
+        - name: Push core images
+          commands:
+            - checkout
+            - bash hack/ci-push-images.sh
