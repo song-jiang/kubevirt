@@ -15,10 +15,8 @@ blocks:
       env_vars:
         - name: DOCKER_PREFIX
           value: quay.io/tigeradev
-        - name: IMAGE_PREFIX
-          value: "mockvirt-"
         - name: DOCKER_TAG
-          value: v1.8.1
+          value: mockvirt-v1.8.1
       prologue:
         commands:
           - echo "$QUAY_TOKEN" | docker login quay.io --username "$QUAY_USER" --password-stdin
