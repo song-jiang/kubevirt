@@ -29,14 +29,17 @@ echo "  Registry: ${DOCKER_PREFIX}"
 echo "  Tag:      ${DOCKER_TAG}"
 echo ""
 
+# Build push commands for all targets. Run in a single hack/dockerized
+# invocation to avoid repeated container setup (the bazel server's
+# bind-mounted docker config conflicts with docker-cp on re-entry).
+PUSH_CMDS=""
 for target in "${TARGETS[@]}"; do
-    echo "--- Pushing ${DOCKER_PREFIX}/${target}:${DOCKER_TAG} ---"
-    hack/dockerized "bazel run //:push-${target} -- --repository ${DOCKER_PREFIX}/${target} --tag ${DOCKER_TAG}"
+    PUSH_CMDS="${PUSH_CMDS}echo '--- Pushing ${DOCKER_PREFIX}/${target}:${DOCKER_TAG} ---' && bazel run //:push-${target} -- --repository ${DOCKER_PREFIX}/${target} --tag ${DOCKER_TAG} && "
 done
+# Append manifest generation
+PUSH_CMDS="${PUSH_CMDS}echo '=== Generating manifests ===' && DOCKER_PREFIX=${DOCKER_PREFIX} DOCKER_TAG=${DOCKER_TAG} hack/bazel-build.sh && hack/manifests.sh"
 
-echo ""
-echo "=== Generating manifests ==="
-hack/dockerized "DOCKER_PREFIX=${DOCKER_PREFIX} DOCKER_TAG=${DOCKER_TAG} hack/bazel-build.sh && hack/manifests.sh"
+hack/dockerized "${PUSH_CMDS}"
 
 echo ""
 echo "=== Done ==="
