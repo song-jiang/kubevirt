@@ -11,7 +11,7 @@ blocks:
       when: "branch = 'mockVirt-v1.8.1'"
     task:
       secrets:
-        - name: quay-robot-calico+semaphoreci
+        - name: quay-tigeradev-hashrelease
       env_vars:
         - name: DOCKER_PREFIX
           value: quay.io/tigeradev
