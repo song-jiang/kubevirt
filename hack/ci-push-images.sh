@@ -43,11 +43,13 @@ if [[ -f "${HOME}/.docker/config.json" ]]; then
 fi
 
 # Build push commands for all targets, run in a single hack/dockerized invocation.
-PUSH_CMDS=""
+# Source bootstrap.sh first to set up the sandbox (RPM mounts for cross-compilation).
+# Without this, bazel run //:push-* fails with "Sandbox is not up to date".
+PUSH_CMDS="source hack/common.sh && source hack/bootstrap.sh && source hack/config.sh && "
 for target in "${TARGETS[@]}"; do
     PUSH_CMDS="${PUSH_CMDS}echo '--- Pushing ${DOCKER_PREFIX}/${target}:${DOCKER_TAG} ---' && bazel run //:push-${target} -- --repository ${DOCKER_PREFIX}/${target} --tag ${DOCKER_TAG} && "
 done
-# Append manifest generation
+# Append manifest generation (hack/bazel-build.sh sources bootstrap.sh itself)
 PUSH_CMDS="${PUSH_CMDS}echo '=== Generating manifests ===' && DOCKER_PREFIX=${DOCKER_PREFIX} DOCKER_TAG=${DOCKER_TAG} hack/bazel-build.sh && hack/manifests.sh"
 
 hack/dockerized "${SETUP_AUTH}${PUSH_CMDS}"
