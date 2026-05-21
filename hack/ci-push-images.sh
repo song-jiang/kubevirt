@@ -49,8 +49,10 @@ PUSH_CMDS="source hack/common.sh && source hack/bootstrap.sh && source hack/conf
 for target in "${TARGETS[@]}"; do
     PUSH_CMDS="${PUSH_CMDS}echo '--- Pushing ${DOCKER_PREFIX}/${target}:${DOCKER_TAG} ---' && bazel run //:push-${target} -- --repository ${DOCKER_PREFIX}/${target} --tag ${DOCKER_TAG} && "
 done
-# Append manifest generation (hack/bazel-build.sh sources bootstrap.sh itself)
-PUSH_CMDS="${PUSH_CMDS}echo '=== Generating manifests ===' && DOCKER_PREFIX=${DOCKER_PREFIX} DOCKER_TAG=${DOCKER_TAG} hack/bazel-build.sh && hack/manifests.sh"
+# Append manifest generation. Call hack/build-manifests.sh directly (not
+# hack/manifests.sh, which wraps it in hack/dockerized — we're already inside).
+# hack/bazel-build.sh sources bootstrap.sh and config.sh itself.
+PUSH_CMDS="${PUSH_CMDS}echo '=== Generating manifests ===' && DOCKER_PREFIX=${DOCKER_PREFIX} DOCKER_TAG=${DOCKER_TAG} hack/bazel-build.sh && DOCKER_PREFIX=${DOCKER_PREFIX} DOCKER_TAG=${DOCKER_TAG} hack/build-manifests.sh"
 
 hack/dockerized "${SETUP_AUTH}${PUSH_CMDS}"
 
