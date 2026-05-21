@@ -380,6 +380,27 @@ func (c *VirtualMachineController) execute(key string) error {
 
 	if domainExists &&
 		(domainMigrated(domain) || domain.DeletionTimestamp != nil) {
+		// In simulation mode, the source domain transitions to Shutoff/Migrated
+		// nearly simultaneously with the target receiving the domain. Without a
+		// real libvirt migration delay, the VM controller can reach this point
+		// before the migration-target controller has finished finalization
+		// (setting MigrationState.Completed, NodeName, etc.).
+		// Calling deleteVM() now would remove the domain from cache and close
+		// the launcher client, causing calculateVmPhaseForStatusReason to return
+		// Failed for a Running VMI with no domain.
+		//
+		// Defer cleanup until the target controller has set Completed=true via
+		// finalizeMigration. We check Completed/Failed rather than EndTimestamp
+		// because the target's ackMigrationCompletion sets EndTimestamp before
+		// finalizeMigration sets Completed.
+		if c.clusterConfig.SimulationMode() &&
+			vmi.Status.MigrationState != nil &&
+			!vmi.Status.MigrationState.Completed &&
+			!vmi.Status.MigrationState.Failed {
+			c.logger.Object(vmi).Info("simulation mode: deferring orphan cleanup, migration not yet finalized")
+			c.queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Second*2)
+			return nil
+		}
 		c.logger.Object(vmi).V(4).Info("detected orphan vmi")
 		return c.deleteVM(vmi)
 	}
@@ -1844,9 +1865,12 @@ func (c *VirtualMachineController) vmUpdateHelperDefault(vmi *v1.VirtualMachineI
 		return err
 	}
 
-	cgroupManager, err := getCgroupManager(vmi, c.host, c.hypervisorNodeInfo, c.clusterConfig.AllowEmulation())
-	if err != nil {
-		return err
+	var cgroupManager cgroup.Manager
+	if !c.clusterConfig.SimulationMode() {
+		cgroupManager, err = getCgroupManager(vmi, c.host, c.hypervisorNodeInfo, c.clusterConfig.AllowEmulation())
+		if err != nil {
+			return err
+		}
 	}
 
 	var errorTolerantFeaturesError []error
@@ -1897,6 +1921,11 @@ func (c *VirtualMachineController) handleVMIState(vmi *v1.VirtualMachineInstance
 
 // handleRunningVMI contains the logic specifically for running VMs (hotplugging in running state, metrics, network updates)
 func (c *VirtualMachineController) handleRunningVMI(vmi *v1.VirtualMachineInstance, cgroupManager cgroup.Manager, errorTolerantFeaturesError *[]error) error {
+	if c.clusterConfig.SimulationMode() {
+		// In simulation mode, skip hotplug, isolation detection, metrics,
+		// and network updates. There is no real QEMU process to detect.
+		return nil
+	}
 	if err := c.hotplugSriovInterfaces(vmi); err != nil {
 		c.logger.Object(vmi).Error(err.Error())
 	}
@@ -1934,6 +1963,13 @@ func (c *VirtualMachineController) handleStartingVMI(
 	vmi *v1.VirtualMachineInstance,
 	cgroupManager cgroup.Manager,
 ) (bool, error) {
+	if c.clusterConfig.SimulationMode() {
+		// In simulation mode, skip container disk, hotplug volume, device ownership,
+		// network setup, and resource adjustment steps. The pod network is already
+		// configured by the CNI plugin at pod creation time.
+		return true, nil
+	}
+
 	// give containerDisks some time to become ready before throwing errors on retries
 	info := c.launcherClients.GetLauncherClientInfo(vmi)
 	if ready, err := c.containerDiskMounter.ContainerDisksReady(vmi, info.NotInitializedSince); !ready {

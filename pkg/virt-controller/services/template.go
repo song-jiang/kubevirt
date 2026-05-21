@@ -344,6 +344,13 @@ func (t *TemplateService) renderLaunchManifest(vmi *v1.VirtualMachineInstance, i
 	gracePeriodSeconds := gracePeriodInSeconds(vmi) + gracePeriodPaddingSeconds
 	gracePeriodKillAfter := gracePeriodSeconds + gracePeriodPaddingSeconds
 
+	// In simulation mode there is no real QEMU process to gracefully shut
+	// down, so use a minimal termination grace period to speed up source
+	// pod cleanup after migration.
+	if t.clusterConfig.SimulationMode() {
+		gracePeriodKillAfter = 5
+	}
+
 	imagePullSecrets := imgPullSecrets(vmi.Spec.Volumes...)
 	if util.HasKernelBootContainerImage(vmi) && vmi.Spec.Domain.Firmware.KernelBoot.Container.ImagePullSecret != "" {
 		imagePullSecrets = appendUniqueImagePullSecret(imagePullSecrets, k8sv1.LocalObjectReference{
@@ -423,6 +430,10 @@ func (t *TemplateService) renderLaunchManifest(vmi *v1.VirtualMachineInstance, i
 
 	if t.clusterConfig.AllowEmulation() {
 		command = append(command, "--allow-emulation")
+	}
+
+	if t.clusterConfig.SimulationMode() {
+		command = append(command, "--simulation-mode")
 	}
 
 	if checkForKeepLauncherAfterFailure(vmi) {
@@ -837,7 +848,13 @@ func (t *TemplateService) newContainerSpecRenderer(vmi *v1.VirtualMachineInstanc
 		WithPorts(vmi),
 		WithCapabilities(vmi),
 	}
-	if util.IsNonRootVMI(vmi) {
+	// In simulation mode, run the compute container as root (UID 0) so that
+	// it gets all capabilities in the bounding set (including CAP_NET_RAW
+	// needed for Gratuitous ARP). Non-root containers in Kubernetes only
+	// receive capabilities via file caps on the binary; the bazeldnf xattrs
+	// tool does not support cap_net_raw, so running as root is the simplest
+	// workaround for test clusters.
+	if util.IsNonRootVMI(vmi) && !t.clusterConfig.SimulationMode() {
 		computeContainerOpts = append(computeContainerOpts, WithNonRoot(userId))
 		computeContainerOpts = append(computeContainerOpts, WithDropALLCapabilities())
 	}
@@ -911,9 +928,15 @@ func (t *TemplateService) newVolumeRenderer(vmi *v1.VirtualMachineInstance, imag
 func (t *TemplateService) newResourceRenderer(vmi *v1.VirtualMachineInstance, networkToResourceMap map[string]string, memoryOverhead resource.Quantity) (*ResourceRenderer, error) {
 	vmiResources := vmi.Spec.Domain.Resources
 	hypervisorResource := ConstructHypervisorResourceName(t.launcherHypervisorResources)
+	var virtResources k8sv1.ResourceList
+	if t.clusterConfig.SimulationMode() {
+		virtResources = k8sv1.ResourceList{}
+	} else {
+		virtResources = getRequiredResources(vmi, hypervisorResource, t.clusterConfig.AllowEmulation())
+	}
 	baseOptions := []ResourceRendererOption{
 		WithEphemeralStorageRequest(),
-		WithVirtualizationResources(getRequiredResources(vmi, hypervisorResource, t.clusterConfig.AllowEmulation())),
+		WithVirtualizationResources(virtResources),
 	}
 
 	if err := validatePermittedHostDevices(&vmi.Spec, t.clusterConfig); err != nil {

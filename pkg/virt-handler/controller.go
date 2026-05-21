@@ -257,6 +257,9 @@ func (c *BaseController) configureVirtioFS(vmi *v1.VirtualMachineInstance, isola
 }
 
 func (c *BaseController) setupDevicesOwnerships(vmi *v1.VirtualMachineInstance, recorder record.EventRecorder) error {
+	if c.clusterConfig.SimulationMode() {
+		return nil
+	}
 	isolationRes, err := c.podIsolationDetector.Detect(vmi)
 	if err != nil {
 		return fmt.Errorf(failedDetectIsolationFmt, err)
@@ -301,6 +304,9 @@ func (c *BaseController) setupDevicesOwnerships(vmi *v1.VirtualMachineInstance, 
 
 func (c *BaseController) setupNetwork(vmi *v1.VirtualMachineInstance, networks []v1.Network, netConf netconf) error {
 	if len(networks) == 0 {
+		return nil
+	}
+	if c.clusterConfig.SimulationMode() {
 		return nil
 	}
 

@@ -1109,6 +1109,13 @@ var CRDsValidation map[string]string = map[string]string{
                     allowed to be compared to the requested size (to account for various overheads).
                     Defaults to 10
                   type: integer
+                simulationMode:
+                  description: |-
+                    SimulationMode when set to true runs virt-launcher without libvirt/QEMU,
+                    faking VM lifecycle and migration. This allows testing infrastructure
+                    concerns (networking, storage, scheduling) on clusters without hardware
+                    virtualization support. Defaults to false
+                  type: boolean
                 useEmulation:
                   description: |-
                     UseEmulation can be set to true to allow fallback to software emulation
