@@ -22,7 +22,11 @@ fi
 
 export DOCKER_PREFIX DOCKER_TAG
 
-TARGETS=(virt-operator virt-api virt-controller virt-handler virt-launcher)
+# virt-synchronization-controller is required for decentralized (cross-cluster)
+# live migration: virt-operator deploys it when the DecentralizedLiveMigration
+# feature gate is enabled. It must be pushed to the SAME registry prefix as the
+# other components (the operator derives component images from one prefix).
+TARGETS=(virt-operator virt-api virt-controller virt-handler virt-launcher virt-synchronization-controller)
 
 echo "=== Building and pushing images ==="
 echo "  Registry: ${DOCKER_PREFIX}"

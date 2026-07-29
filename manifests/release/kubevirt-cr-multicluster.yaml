@@ -1,0 +1,29 @@
+---
+# MockVirt KubeVirt CR for cross-cluster (decentralized) live migration.
+#
+# Same as kubevirt-cr.yaml but additionally:
+#   * simulationMode: true         - use the FakeDomainManager (no nested virt)
+#   * DecentralizedLiveMigration   - feature gate; enabling it makes virt-operator
+#                                    deploy the virt-synchronization-controller
+#                                    (its own image; must be present in the
+#                                    operator's registry, or overridden via
+#                                    VIRT_SYNCHRONIZATIONCONTROLLER_IMAGE).
+#
+# Apply this on BOTH clusters of the two-cluster fabric. See the Calico repo
+# hack/test/kind/multicluster/ harness (DEPLOY_MOCKVIRT=true).
+apiVersion: kubevirt.io/v1
+kind: KubeVirt
+metadata:
+  name: kubevirt
+  namespace: kubevirt
+spec:
+  certificateRotateStrategy: {}
+  configuration:
+    developerConfiguration:
+      simulationMode: true
+      featureGates:
+        - DecentralizedLiveMigration
+    imagePullPolicy: IfNotPresent
+  customizeComponents: {}
+  imagePullPolicy: IfNotPresent
+  workloadUpdateStrategy: {}

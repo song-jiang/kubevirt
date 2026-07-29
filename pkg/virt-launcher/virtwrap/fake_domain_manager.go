@@ -215,6 +215,23 @@ func (f *FakeDomainManager) SyncVMI(vmi *v1.VirtualMachineInstance, allowEmulati
 
 	log.Log.Object(vmi).Info("Simulation mode: SyncVMI called")
 
+	// Decentralized-migration receiver guard: a target VMI created with
+	// runStrategy WaitAsReceiver sits in phase WaitingForSync until the
+	// migration begins, and must NOT be brought up as a running domain here.
+	// The receiving domain is created only via PrepareMigrationTarget ->
+	// simulateTargetReceive. Stock virt-handler won't call SyncVMI in this
+	// phase (its shouldUpdate phase-equality gate blocks it), but guard
+	// defensively since the decentralized flow is new to simulation mode.
+	// The cmd-server discards the returned spec (server.go SyncVirtualMachine),
+	// so returning the current domain (or nil before it exists) is safe.
+	if vmi.IsWaitingForSync() {
+		log.Log.Object(vmi).Info("Simulation mode: SyncVMI skipped for WaitingForSync receiver VMI; target domain comes up via PrepareMigrationTarget")
+		if f.domain != nil {
+			return &f.domain.Spec, nil
+		}
+		return nil, nil
+	}
+
 	domainName := api.VMINamespaceKeyFunc(vmi)
 
 	if f.domain == nil {
